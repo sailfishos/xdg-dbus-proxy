@@ -5,6 +5,7 @@ Summary:        Filtering proxy for D-Bus connections
 License:        LGPLv2+
 URL:            https://github.com/flatpak/xdg-dbus-proxy
 Source0:        %{name}-%{version}.tar.xz
+Patch1:         0001-Fix-GVariant-reference-leaks.patch
 
 BuildRequires:  autoconf
 BuildRequires:  autoconf-archive
@@ -20,7 +21,7 @@ originally part of the flatpak project, but it has been broken out
 as a standalone module to facilitate using it in other contexts.
 
 %prep
-%setup -q -n %{name}-%{version}/upstream
+%autosetup -p1 -n %{name}-%{version}/upstream
 
 %build
 %autogen --disable-static --enable-man=no
