@@ -1,0 +1,322 @@
+From 6f6eb0cdfa74a77ffa4a9099fdeb4bbfee936d15 Mon Sep 17 00:00:00 2001
+From: Simo Piiroinen <simo.piiroinen@jolla.com>
+Date: Mon, 29 Nov 2021 15:33:51 +0200
+Subject: [PATCH] Use hash table for mapping reply serials between connections
+
+Using offsets for mapping serial numbers between bus and client
+connections can break down if proxy receives messages not meant for
+client consumption from bus while waiting for replies to method call
+messages sent by client. Which then leads to client side hitting
+timeout errors because replies get ignored due to incorrect reply
+serial numbers.
+
+Assign bus connection serials immediately after receiving data from
+client connection - so that bulk of proxy logic needs to deal only with
+bus connection serial numbers and offset calculations can be
+eliminated.
+
+Also - when dealing with method call messages - store bus to client
+connection mapping into hash table. Then utilize data in the hash table
+to modify reply serials when forwarding messages to client connection.
+
+Signed-off-by: Simo Piiroinen <simo.piiroinen@jolla.com>
+---
+ flatpak-proxy.c | 115 +++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 74 insertions(+), 41 deletions(-)
+
+diff --git a/flatpak-proxy.c b/flatpak-proxy.c
+index 0e3a5f2..379d9a3 100644
+--- a/flatpak-proxy.c
++++ b/flatpak-proxy.c
+@@ -228,6 +228,7 @@ typedef struct
+   const char *sender;
+   const char *signature;
+   gboolean    has_reply_serial;
++  guint32     reply_serial_pos;
+   guint32     reply_serial;
+   guint32     unix_fds;
+ } Header;
+@@ -289,9 +290,9 @@ struct FlatpakProxyClient
+   ProxySide     bus_side;
+ 
+   /* Filtering data: */
+-  guint32     serial_offset;
+-  guint32     hello_serial;
+-  guint32     last_serial;
++  guint32     last_bus_serial;
++  guint32     last_client_serial;
++  GHashTable *bus_to_client_serial;
+   GHashTable *rewrite_reply;
+   GHashTable *get_owner_reply;
+ 
+@@ -405,6 +406,7 @@ flatpak_proxy_client_finalize (GObject *object)
+   g_byte_array_free (client->auth_buffer, TRUE);
+   g_hash_table_destroy (client->rewrite_reply);
+   g_hash_table_destroy (client->get_owner_reply);
++  g_hash_table_destroy (client->bus_to_client_serial);
+   g_hash_table_destroy (client->unique_id_policy);
+   g_hash_table_destroy (client->unique_id_owned_names);
+ 
+@@ -442,6 +444,7 @@ flatpak_proxy_client_init (FlatpakProxyClient *client)
+   client->auth_buffer = g_byte_array_new ();
+   client->rewrite_reply = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, g_object_unref);
+   client->get_owner_reply = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, g_free);
++  client->bus_to_client_serial = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, NULL);
+   client->unique_id_policy = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+   client->unique_id_owned_names = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) string_list_free);
+ }
+@@ -1128,13 +1131,29 @@ header_free (Header *header)
+   g_free (header);
+ }
+ 
++static void
++set_header_serial (Header *header, guint32 serial)
++{
++  header->serial = serial;
++  write_uint32 (header, &header->buffer->data[8], serial);
++}
++
++static void
++set_header_reply_serial (Header *header, guint32 reply_serial)
++{
++  if (header->has_reply_serial)
++    {
++      header->reply_serial = reply_serial;
++      write_uint32 (header, &header->buffer->data[header->reply_serial_pos], reply_serial);
++    }
++}
++
+ static Header *
+-parse_header (Buffer *buffer, guint32 serial_offset, guint32 reply_serial_offset, guint32 hello_serial)
++parse_header (Buffer *buffer)
+ {
+   guint32 array_len, header_len;
+   guint32 offset, end_offset;
+   guint8 header_type;
+-  guint32 reply_serial_pos = 0;
+   const char *signature;
+ 
+   g_autoptr(Header) header = g_new0 (Header, 1);
+@@ -1229,8 +1248,8 @@ parse_header (Buffer *buffer, guint32 serial_offset, guint32 reply_serial_offset
+             return NULL;
+ 
+           header->has_reply_serial = TRUE;
+-          reply_serial_pos = offset;
+-          header->reply_serial = read_uint32 (header, &buffer->data[offset]);
++          header->reply_serial_pos = offset;
++          header->reply_serial = read_uint32 (header, &buffer->data[header->reply_serial_pos]);
+           offset += 4;
+           break;
+ 
+@@ -1304,17 +1323,6 @@ parse_header (Buffer *buffer, guint32 serial_offset, guint32 reply_serial_offset
+       return NULL;
+     }
+ 
+-  if (serial_offset > 0)
+-    {
+-      header->serial += serial_offset;
+-      write_uint32 (header, &buffer->data[8], header->serial);
+-    }
+-
+-  if (reply_serial_offset > 0 &&
+-      header->has_reply_serial &&
+-      header->reply_serial > hello_serial + reply_serial_offset)
+-    write_uint32 (header, &buffer->data[reply_serial_pos], header->reply_serial - reply_serial_offset);
+-
+   return g_steal_pointer (&header);
+ }
+ 
+@@ -1561,7 +1569,7 @@ get_error_for_header (FlatpakProxyClient *client, Header *header, const char *er
+   reply = g_dbus_message_new ();
+   g_dbus_message_set_message_type (reply, G_DBUS_MESSAGE_TYPE_ERROR);
+   g_dbus_message_set_flags (reply, G_DBUS_MESSAGE_FLAGS_NO_REPLY_EXPECTED);
+-  g_dbus_message_set_reply_serial (reply, header->serial - client->serial_offset);
++  g_dbus_message_set_reply_serial (reply, header->serial);
+   g_dbus_message_set_error_name (reply, error);
+   g_dbus_message_set_body (reply, g_variant_new ("(s)", error));
+ 
+@@ -1576,7 +1584,7 @@ get_bool_reply_for_header (FlatpakProxyClient *client, Header *header, gboolean
+   reply = g_dbus_message_new ();
+   g_dbus_message_set_message_type (reply, G_DBUS_MESSAGE_TYPE_METHOD_RETURN);
+   g_dbus_message_set_flags (reply, G_DBUS_MESSAGE_FLAGS_NO_REPLY_EXPECTED);
+-  g_dbus_message_set_reply_serial (reply, header->serial - client->serial_offset);
++  g_dbus_message_set_reply_serial (reply, header->serial);
+   g_dbus_message_set_body (reply, g_variant_new ("(b)", val));
+ 
+   return reply;
+@@ -1998,19 +2006,19 @@ update_socket_messages (ProxySide *side, Buffer *buffer, Header *header)
+   return TRUE;
+ }
+ 
+-static void
++static guint
+ queue_fake_message (FlatpakProxyClient *client, GDBusMessage *message, ExpectedReplyType reply_type)
+ {
+   Buffer *buffer;
+-
+-  client->last_serial++;
+-  client->serial_offset++;
+-  g_dbus_message_set_serial (message, client->last_serial);
++  guint bus_serial = ++client->last_bus_serial;
++  g_dbus_message_set_serial (message, bus_serial);
+   buffer = message_to_buffer (message);
+   g_object_unref (message);
+ 
+   queue_outgoing_buffer (&client->bus_side, buffer);
+-  queue_expected_reply (&client->client_side, client->last_serial, reply_type);
++  if (reply_type != EXPECTED_REPLY_NONE)
++    queue_expected_reply (&client->client_side, bus_serial, reply_type);
++  return bus_serial;
+ }
+ 
+ /* After the first Hello message we need to synthesize a bunch of messages to synchronize the
+@@ -2053,21 +2061,21 @@ queue_initial_name_ops (FlatpakProxyClient *client)
+       else
+         match = g_variant_new_printf ("type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='%s'", name);
+       g_dbus_message_set_body (message, g_variant_new_tuple (&match, 1));
+-      queue_fake_message (client, message, EXPECTED_REPLY_FILTER);
++      guint bus_serial = queue_fake_message (client, message, EXPECTED_REPLY_FILTER);
+ 
+       if (client->proxy->log_messages)
+-        g_print ("C%d: -> org.freedesktop.DBus fake %sAddMatch for %s\n", client->last_serial, name_needs_subtree ? "wildcarded " : "", name);
++        g_print ("C%d: -> org.freedesktop.DBus fake %sAddMatch for %s\n", bus_serial, name_needs_subtree ? "wildcarded " : "", name);
+ 
+       if (!name_needs_subtree)
+         {
+           /* Get the current owner of the name (if any) so we can apply policy to it */
+           message = g_dbus_message_new_method_call ("org.freedesktop.DBus", "/", "org.freedesktop.DBus", "GetNameOwner");
+           g_dbus_message_set_body (message, g_variant_new ("(s)", name));
+-          queue_fake_message (client, message, EXPECTED_REPLY_FAKE_GET_NAME_OWNER);
+-          g_hash_table_replace (client->get_owner_reply, GINT_TO_POINTER (client->last_serial), g_strdup (name));
++          guint bus_serial = queue_fake_message (client, message, EXPECTED_REPLY_FAKE_GET_NAME_OWNER);
++          g_hash_table_replace (client->get_owner_reply, GINT_TO_POINTER (bus_serial), g_strdup (name));
+ 
+           if (client->proxy->log_messages)
+-            g_print ("C%d: -> org.freedesktop.DBus fake GetNameOwner for %s\n", client->last_serial, name);
++            g_print ("C%d: -> org.freedesktop.DBus fake GetNameOwner for %s\n", bus_serial, name);
+         }
+       else
+         has_wildcards = TRUE; /* Send ListNames below */
+@@ -2082,10 +2090,10 @@ queue_initial_name_ops (FlatpakProxyClient *client)
+          Do it before the GetNameOwner to avoid races */
+       message = g_dbus_message_new_method_call ("org.freedesktop.DBus", "/", "org.freedesktop.DBus", "ListNames");
+       g_dbus_message_set_body (message, g_variant_new ("()"));
+-      queue_fake_message (client, message, EXPECTED_REPLY_FAKE_LIST_NAMES);
++      guint bus_serial = queue_fake_message (client, message, EXPECTED_REPLY_FAKE_LIST_NAMES);
+ 
+       if (client->proxy->log_messages)
+-        g_print ("C%d: -> org.freedesktop.DBus fake ListNames\n", client->last_serial);
++        g_print ("C%d: -> org.freedesktop.DBus fake ListNames\n", bus_serial);
+ 
+       /* Stop reading from the client, to avoid incoming messages fighting with the ListNames roundtrip.
+          We will start it again once we have handled the ListNames reply */
+@@ -2123,11 +2131,11 @@ queue_wildcard_initial_name_ops (FlatpakProxyClient *client, Header *header, Buf
+               /* Get the current owner of the name (if any) so we can apply policy to it */
+               GDBusMessage *message = g_dbus_message_new_method_call ("org.freedesktop.DBus", "/", "org.freedesktop.DBus", "GetNameOwner");
+               g_dbus_message_set_body (message, g_variant_new ("(s)", name));
+-              queue_fake_message (client, message, EXPECTED_REPLY_FAKE_GET_NAME_OWNER);
+-              g_hash_table_replace (client->get_owner_reply, GINT_TO_POINTER (client->last_serial), g_strdup (name));
++              guint bus_serial = queue_fake_message (client, message, EXPECTED_REPLY_FAKE_GET_NAME_OWNER);
++              g_hash_table_replace (client->get_owner_reply, GINT_TO_POINTER (bus_serial), g_strdup (name));
+ 
+               if (client->proxy->log_messages)
+-                g_print ("C%d: -> org.freedesktop.DBus fake GetNameOwner for %s\n", client->last_serial, name);
++                g_print ("C%d: -> org.freedesktop.DBus fake GetNameOwner for %s\n", bus_serial, name);
+             }
+         }
+       g_free (names);
+@@ -2149,7 +2157,7 @@ got_buffer_from_client (FlatpakProxyClient *client, ProxySide *side, Buffer *buf
+ 
+       /* Filter and rewrite outgoing messages as needed */
+ 
+-      header = parse_header (buffer, client->serial_offset, 0, 0);
++      header = parse_header (buffer);
+       if (header == NULL)
+         {
+           g_warning ("Invalid message header format");
+@@ -2163,14 +2171,22 @@ got_buffer_from_client (FlatpakProxyClient *client, ProxySide *side, Buffer *buf
+ 
+       /* Make sure the client is not playing games with the serials, as that
+          could confuse us. */
+-      if (header->serial <= client->last_serial)
++      if (header->serial <= client->last_client_serial)
+         {
+           g_warning ("Invalid client serial");
+           side_closed (side);
+           buffer_unref (buffer);
+           return;
+         }
+-      client->last_serial = header->serial;
++      client->last_client_serial = header->serial;
++
++      /* Remap serial number from proxy-client to proxy-bus context */
++      guint bus_serial = ++client->last_bus_serial;
++      if (client_message_generates_reply (header))
++        g_hash_table_replace (client->bus_to_client_serial,
++                              GUINT_TO_POINTER (bus_serial),
++                              GUINT_TO_POINTER (header->serial));
++      set_header_serial (header, bus_serial);
+ 
+       if (client->proxy->log_messages)
+         print_outgoing_header (header);
+@@ -2181,7 +2197,6 @@ got_buffer_from_client (FlatpakProxyClient *client, ProxySide *side, Buffer *buf
+           g_strcmp0 (header->member, "Hello") == 0)
+         {
+           expecting_reply = EXPECTED_REPLY_HELLO;
+-          client->hello_serial = header->serial;
+         }
+ 
+       handler = get_dbus_method_handler (client, header);
+@@ -2458,7 +2473,7 @@ got_buffer_from_bus (FlatpakProxyClient *client, ProxySide *side, Buffer *buffer
+ 
+       /* Filter and rewrite incoming messages as needed */
+ 
+-      header = parse_header (buffer, 0, client->serial_offset, client->hello_serial);
++      header = parse_header (buffer);
+       if (header == NULL)
+         {
+           g_warning ("Invalid message header format");
+@@ -2513,7 +2528,9 @@ got_buffer_from_bus (FlatpakProxyClient *client, ProxySide *side, Buffer *buffer
+ 
+               g_dbus_message_set_serial (rewritten, header->serial);
+               g_clear_pointer (&buffer, buffer_unref);
++              g_clear_pointer (&header, header_free);
+               buffer = message_to_buffer (rewritten);
++              header = parse_header (buffer);
+ 
+               g_hash_table_remove (client->rewrite_reply,
+                                    GINT_TO_POINTER (header->reply_serial));
+@@ -2572,7 +2589,9 @@ got_buffer_from_bus (FlatpakProxyClient *client, ProxySide *side, Buffer *buffer
+ 
+                   filtered_buffer = filter_names_list (client, buffer);
+                   g_clear_pointer (&buffer, buffer_unref);
++                  g_clear_pointer (&header, header_free);
+                   buffer = filtered_buffer;
++                  header = parse_header (buffer);
+                 }
+ 
+               break;
+@@ -2635,6 +2654,20 @@ got_buffer_from_bus (FlatpakProxyClient *client, ProxySide *side, Buffer *buffer
+ 
+       if (buffer && client_message_generates_reply (header))
+         queue_expected_reply (side, header->serial, EXPECTED_REPLY_NORMAL);
++
++      /* Remap reply_serial numbers from proxy-bus to proxy-client context */
++      if (buffer && header->has_reply_serial)
++        {
++          g_assert (header->buffer == buffer);
++          guint bus_serial = header->reply_serial;
++          guint client_serial = GPOINTER_TO_UINT (g_hash_table_lookup (client->bus_to_client_serial,
++                                                                       GUINT_TO_POINTER (bus_serial)));
++          if (client_serial)
++            g_hash_table_remove (client->bus_to_client_serial, GUINT_TO_POINTER (bus_serial));
++          else
++            g_warning ("can't map bus reply_serial %u\n", bus_serial);
++          set_header_reply_serial (header, client_serial);
++        }
+     }
+ 
+   if (buffer)
+-- 
+2.17.1
+
