@@ -1,0 +1,199 @@
+From a8aed433ea3f2e278f894935988b72b64bf0f42a Mon Sep 17 00:00:00 2001
+From: Simo Piiroinen <simo.piiroinen@jolla.com>
+Date: Thu, 16 Sep 2021 12:18:41 +0300
+Subject: [PATCH] Add D-Bus interface for querying client process details
+
+Various services in Sailfish OS need to find out details about D-Bus
+clients e.g. for purpose the of showing originating application of
+notifications. When dealing with sandboxed applications launched via
+sailjail daemon, use of standard D-Bus client identification methods
+such as org.freedesktop.DBus.GetConnectionUnixProcessID yields pid of
+the xdg-dbus-proxy process rather than the application behind the proxy.
+
+Make it so that each bus facing connection xdg-dbus-proxy implicitly
+provides a D-Bus interface that can be used for querying details about
+the client behind the proxy connection.
+
+Implement org.sailfishos.sailjailed.Identify() method call that returns
+pid, uid, and other details about the connected client.
+
+D-Bus policy configuration allowing/denying such method calls to be made
+is assumed to be defined elsewhere.
+---
+ flatpak-proxy.c | 146 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 145 insertions(+), 1 deletion(-)
+
+diff --git a/flatpak-proxy.c b/flatpak-proxy.c
+index 8bf9a4f..0e3a5f2 100644
+--- a/flatpak-proxy.c
++++ b/flatpak-proxy.c
+@@ -20,6 +20,7 @@
+ 
+ #include "config.h"
+ 
++#include <stdio.h>
+ #include <unistd.h>
+ #include <string.h>
+ 
+@@ -2306,6 +2307,145 @@ handle_deny:
+     queue_initial_name_ops (client);
+ }
+ 
++static gchar *
++get_pid_exe (gint32 pid)
++{
++  gchar *path = g_strdup_printf ("/proc/%d/exe", pid);
++  gchar *data = g_file_read_link (path, NULL);
++  g_free (path);
++  return data;
++}
++
++static gchar *
++get_pid_comm (gint32 pid)
++{
++  gchar *path = g_strdup_printf ("/proc/%d/comm", pid);
++  GFile *file = g_file_new_for_path (path);
++  gchar *data = NULL;
++  if (g_file_load_contents (file, NULL, &data, NULL, NULL, NULL))
++    data[strcspn (data, "\r\n")] = 0;
++  g_free (path);
++  g_object_unref (file);
++  return data;
++}
++
++static gchar *
++get_pid_cmdline (gint32 pid)
++{
++  gchar *path = g_strdup_printf ("/proc/%d/cmdline", pid);
++  GFile *file = g_file_new_for_path (path);
++  gchar *data = NULL;
++  if (g_file_load_contents (file, NULL, &data, NULL, NULL, NULL))
++    data[strcspn (data, "\n")] = 0;
++  g_free (path);
++  g_object_unref (file);
++  return data;
++}
++
++static gchar *
++get_pid_maps (gint32 pid)
++{
++  gchar *path = g_strdup_printf ("/proc/%d/maps", pid);
++  gchar *data = NULL;
++  FILE *file = fopen (path, "r");
++  if (file)
++    {
++      size_t size = 0;
++      char *text = NULL;
++      while (getline (&text, &size, file) >= 0)
++        {
++          if (!strstr (text, " r-xp "))
++            continue;
++          const char *mapped = strchr (text, '/');
++          if (!mapped)
++            continue;
++          if (!strstr (mapped, "/bin/"))
++            continue;
++          data = g_strndup (mapped, strcspn (mapped, "\n"));
++          break;
++        }
++      free (text);
++      fclose (file);
++    }
++  g_free (path);
++  return data;
++}
++
++static GDBusMessage *
++handle_proxy_identify_method (FlatpakProxyClient *client, GDBusMessage *message)
++{
++  GDBusMessage *reply = NULL;
++  GVariantBuilder *array_builder = g_variant_builder_new (G_VARIANT_TYPE_ARRAY);
++  if (client->client_side.connection)
++    {
++      GSocket *sck = g_socket_connection_get_socket (client->client_side.connection);
++      if (sck)
++        {
++          GCredentials *creds = g_socket_get_credentials (sck, NULL);
++          if (creds)
++            {
++              gint32 pid = g_credentials_get_unix_pid (creds, NULL);
++              if (pid != -1)
++                {
++                  g_variant_builder_add (array_builder, "{sv}", "pid", g_variant_new_int32 (pid));
++                  g_autofree gchar *exe = get_pid_exe (pid);
++                  if (exe)
++                    g_variant_builder_add (array_builder, "{sv}", "exe", g_variant_new_string (exe));
++                  g_autofree gchar *comm_data = get_pid_comm (pid);
++                  if (comm_data && *comm_data)
++                    g_variant_builder_add (array_builder, "{sv}", "comm", g_variant_new_string (comm_data));
++                  g_autofree gchar *cmdline_data = get_pid_cmdline (pid);
++                  if (cmdline_data && *cmdline_data)
++                    g_variant_builder_add (array_builder, "{sv}", "cmdline", g_variant_new_string (cmdline_data));
++                  g_autofree gchar *maps_data = get_pid_maps (pid);
++                  if (maps_data)
++                    g_variant_builder_add (array_builder, "{sv}", "maps", g_variant_new_string (maps_data));
++                }
++              gint32 uid = g_credentials_get_unix_user (creds, NULL);
++              if (uid != -1)
++                g_variant_builder_add (array_builder, "{sv}", "uid", g_variant_new_int32(uid));
++              g_object_unref (creds);
++            }
++        }
++    }
++  if ((reply = g_dbus_message_new_method_reply (message)))
++    g_dbus_message_set_body (reply, g_variant_new ("(a{sv})", array_builder, NULL));
++  g_variant_builder_unref (array_builder);
++  return reply;
++}
++
++static gboolean
++handle_proxy_methods (FlatpakProxyClient *client, Header *header, Buffer *buffer)
++{
++  if (header->type != G_DBUS_MESSAGE_TYPE_METHOD_CALL)
++    return FALSE;
++  if (g_strcmp0 (header->interface, "org.sailfishos.sailjailed"))
++    return FALSE;
++  GDBusMessage *message = g_dbus_message_new_from_blob (buffer->data, buffer->size,
++                                                        G_DBUS_CAPABILITY_FLAGS_NONE, NULL);
++  if (message)
++    {
++      GDBusMessage *reply = NULL;
++      if (!g_strcmp0 (header->member, "Identify"))
++        reply = handle_proxy_identify_method (client, message);
++      else
++        reply = g_dbus_message_new_method_error (message, "org.freedesktop.DBus.Error.UnknownMethod",
++                                                 "Unknown method: %s", header->member);
++      if (!(g_dbus_message_get_flags (message) & G_DBUS_MESSAGE_FLAGS_NO_REPLY_EXPECTED))
++        {
++          if (!reply)
++            reply = g_dbus_message_new_method_error (message, "org.freedesktop.DBus.Error.Failed",
++                                                     "Internal failure at method: %s", header->member);
++          if (reply)
++            queue_fake_message (client, reply, EXPECTED_REPLY_NONE), reply = NULL;
++        }
++      if (reply)
++        g_object_unref (reply);
++      g_object_unref (message);
++    }
++  return TRUE;
++}
++
+ static void
+ got_buffer_from_bus (FlatpakProxyClient *client, ProxySide *side, Buffer *buffer)
+ {
+@@ -2333,7 +2473,11 @@ got_buffer_from_bus (FlatpakProxyClient *client, ProxySide *side, Buffer *buffer
+       if (client->proxy->log_messages)
+         print_incoming_header (header);
+ 
+-      if (header->has_reply_serial)
++      if (handle_proxy_methods (client, header, buffer))
++        {
++          g_clear_pointer (&buffer, buffer_unref);
++        }
++      else if (header->has_reply_serial)
+         {
+           expected_reply = steal_expected_reply (get_other_side (side), header->reply_serial);
+ 
+-- 
+2.17.1
+
