@@ -3,7 +3,7 @@ Version:        0.1.2
 Release:        1
 Summary:        Filtering proxy for D-Bus connections
 License:        LGPLv2+
-URL:            https://github.com/flatpak/xdg-dbus-proxy
+URL:            https://github.com/sailfishos/xdg-dbus-proxy
 Source0:        %{name}-%{version}.tar.xz
 Patch1:         0001-Fix-GVariant-reference-leaks.patch
 Patch2:         0002-Add-D-Bus-interface-for-querying-client-process-deta.patch
