@@ -1,4 +1,4 @@
-From a8aed433ea3f2e278f894935988b72b64bf0f42a Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Simo Piiroinen <simo.piiroinen@jolla.com>
 Date: Thu, 16 Sep 2021 12:18:41 +0300
 Subject: [PATCH] Add D-Bus interface for querying client process details
@@ -24,7 +24,7 @@ is assumed to be defined elsewhere.
  1 file changed, 145 insertions(+), 1 deletion(-)
 
 diff --git a/flatpak-proxy.c b/flatpak-proxy.c
-index 8bf9a4f..0e3a5f2 100644
+index 7153135..85f97fa 100644
 --- a/flatpak-proxy.c
 +++ b/flatpak-proxy.c
 @@ -20,6 +20,7 @@
@@ -35,7 +35,7 @@ index 8bf9a4f..0e3a5f2 100644
  #include <unistd.h>
  #include <string.h>
  
-@@ -2306,6 +2307,145 @@ handle_deny:
+@@ -2618,6 +2619,145 @@ handle_deny:
      queue_initial_name_ops (client);
  }
  
@@ -181,7 +181,7 @@ index 8bf9a4f..0e3a5f2 100644
  static void
  got_buffer_from_bus (FlatpakProxyClient *client, ProxySide *side, Buffer *buffer)
  {
-@@ -2333,7 +2473,11 @@ got_buffer_from_bus (FlatpakProxyClient *client, ProxySide *side, Buffer *buffer
+@@ -2647,7 +2787,11 @@ got_buffer_from_bus (FlatpakProxyClient *client, ProxySide *side, Buffer *buffer
        if (client->proxy->log_messages)
          print_incoming_header (header);
  
@@ -194,6 +194,3 @@ index 8bf9a4f..0e3a5f2 100644
          {
            expected_reply = steal_expected_reply (get_other_side (side), header->reply_serial);
  
--- 
-2.17.1
-
