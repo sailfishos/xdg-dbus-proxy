@@ -24,7 +24,7 @@ is assumed to be defined elsewhere.
  1 file changed, 145 insertions(+), 1 deletion(-)
 
 diff --git a/flatpak-proxy.c b/flatpak-proxy.c
-index 7153135..85f97fa 100644
+index 10a6e030dced28f0c81a840ac3db84ce9e1803c5..9d01910243239889e93734bae8cf96df857e1311 100644
 --- a/flatpak-proxy.c
 +++ b/flatpak-proxy.c
 @@ -20,6 +20,7 @@
@@ -35,7 +35,7 @@ index 7153135..85f97fa 100644
  #include <unistd.h>
  #include <string.h>
  
-@@ -2618,6 +2619,145 @@ handle_deny:
+@@ -2643,6 +2644,145 @@ handle_deny:
      queue_initial_name_ops (client);
  }
  
@@ -181,7 +181,7 @@ index 7153135..85f97fa 100644
  static void
  got_buffer_from_bus (FlatpakProxyClient *client, ProxySide *side, Buffer *buffer)
  {
-@@ -2647,7 +2787,11 @@ got_buffer_from_bus (FlatpakProxyClient *client, ProxySide *side, Buffer *buffer
+@@ -2672,7 +2812,11 @@ got_buffer_from_bus (FlatpakProxyClient *client, ProxySide *side, Buffer *buffer
        if (client->proxy->log_messages)
          print_incoming_header (header);
  
